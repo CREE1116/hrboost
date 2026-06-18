@@ -1,0 +1,26 @@
+[project]
+name = "brstboost"
+version = "0.1.0"
+description = "BRSTBoost: Bayesian Residual State Theory gradient boosting"
+requires-python = ">=3.10"
+dependencies = [
+    "catboost>=1.2.10",
+    "lightgbm>=4.6.0",
+    "matplotlib>=3.10.9",
+    "numpy>=1.24",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.3",
+    "xgboost>=3.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "lightgbm",
+    "xgboost",
+    "catboost",
+]
+
+[tool.uv]
+package = false
