@@ -16,7 +16,7 @@ void brst_fit(BRSTHandle h,
               double reg_lambda, double bhc_lam,
               double subsample, double colsample_bytree,
               int n_bins, double min_child_weight, double gamma,
-              int max_k,
+              int max_k, double lambda_depth_decay,
               const int* cat_features, int n_cat_features,
               int random_state) {
     Params p;
@@ -26,6 +26,7 @@ void brst_fit(BRSTHandle h,
     p.subsample=subsample; p.colsample_bytree=colsample_bytree;
     p.n_bins=n_bins; p.min_child_weight=min_child_weight;
     p.gamma=gamma; p.max_k=max_k;
+    p.lambda_depth_decay=lambda_depth_decay;
     p.cat_features.assign(cat_features, cat_features+n_cat_features);
     p.random_state=random_state;
     static_cast<BRSTBoost*>(h)->fit(X, n, D, y, p);

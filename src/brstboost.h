@@ -64,6 +64,7 @@ struct Params {
     double min_child_weight = 1.0;
     double gamma = 0.0;
     int max_k = 2;
+    double lambda_depth_decay = 1.0;  // λ *= decay^depth; 1.0 = off
     std::vector<int> cat_features;
     int random_state = 0;
 };

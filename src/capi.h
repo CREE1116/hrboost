@@ -23,6 +23,7 @@ void brst_fit(BRSTHandle h,
               double min_child_weight,
               double gamma,
               int    max_k,
+              double lambda_depth_decay,
               const int* cat_features,
               int    n_cat_features,
               int    random_state);

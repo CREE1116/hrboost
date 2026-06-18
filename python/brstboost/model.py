@@ -12,21 +12,23 @@ class BRSTBoost(BaseEstimator, ClassifierMixin):
                  max_leaves=64, reg_lambda=1.0, bhc_lam=0.0,
                  subsample=0.8, colsample_bytree=1.0, n_bins=32,
                  min_child_weight=1.0, gamma=0.0, max_k=2,
+                 lambda_depth_decay=1.0,
                  cat_features=None, random_state=0):
-        self.n_estimators     = n_estimators
-        self.learning_rate    = learning_rate
-        self.max_depth        = max_depth
-        self.max_leaves       = max_leaves
-        self.reg_lambda       = reg_lambda
-        self.bhc_lam          = bhc_lam
-        self.subsample        = subsample
-        self.colsample_bytree = colsample_bytree
-        self.n_bins           = n_bins
-        self.min_child_weight = min_child_weight
-        self.gamma            = gamma
-        self.max_k            = max_k
-        self.cat_features     = cat_features or []
-        self.random_state     = random_state
+        self.n_estimators       = n_estimators
+        self.learning_rate      = learning_rate
+        self.max_depth          = max_depth
+        self.max_leaves         = max_leaves
+        self.reg_lambda         = reg_lambda
+        self.bhc_lam            = bhc_lam
+        self.subsample          = subsample
+        self.colsample_bytree   = colsample_bytree
+        self.n_bins             = n_bins
+        self.min_child_weight   = min_child_weight
+        self.gamma              = gamma
+        self.max_k              = max_k
+        self.lambda_depth_decay = lambda_depth_decay
+        self.cat_features       = cat_features or []
+        self.random_state       = random_state
 
     def fit(self, X, y):
         X = np.ascontiguousarray(X, dtype=np.float32)
@@ -54,6 +56,7 @@ class BRSTBoost(BaseEstimator, ClassifierMixin):
             ctypes.c_double(self.min_child_weight),
             ctypes.c_double(self.gamma),
             ctypes.c_int(self.max_k),
+            ctypes.c_double(self.lambda_depth_decay),
             cat_ptr,
             ctypes.c_int(len(cats)),
             ctypes.c_int(self.random_state),

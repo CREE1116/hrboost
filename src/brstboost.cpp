@@ -8,13 +8,17 @@ namespace brst {
 static inline double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 template<class T> static inline T clamp(T v, T lo, T hi) { return v<lo?lo:(v>hi?hi:v); }
 
-// ── BHC: Bayesian merge criterion ─────────────────────────────────────────────
+// ── BHC merge criterion (numerically stable) ──────────────────────────────────
+// log term is theoretically ≤ 0; clamp removes float rounding noise.
 
 static inline double delta(double Ga, double Ha, double Gb, double Hb, double lam) {
-    double Hab = Ha+Hb, Gab = Ga+Gb;
-    return (Gab*Gab/(Hab+lam) - Ga*Ga/(Ha+lam) - Gb*Gb/(Hb+lam)) * 0.5
-           + 0.5 * std::log((Ha+lam)*(Hb+lam)/(Hab+lam));
+    double ha = std::max(Ha, 1e-10), hb = std::max(Hb, 1e-10);
+    double Hab = ha+hb, Gab = Ga+Gb;
+    double log_t = std::min(0.5*std::log((ha+lam)*(hb+lam)/(Hab+lam)), 0.0);
+    return (Gab*Gab/(Hab+lam) - Ga*Ga/(ha+lam) - Gb*Gb/(hb+lam)) * 0.5 + log_t;
 }
+
+// ── BHC O(B log B): doubly-linked list + max-heap with lazy deletion ──────────
 
 struct BHCResult {
     double gain = -1;
@@ -25,46 +29,67 @@ struct BHCResult {
 };
 
 static BHCResult bhc_split(
-    double* G, double* H, int* cnt, int* last_bin, int S,
+    const double* G_in, const double* H_in,
+    const int* last_bin_in, int S,
     double G_T, double H_T, double G_nan, double H_nan,
     double lam, double min_h, int max_k)
 {
-    while (S > max_k) {
-        double best_d = 0.0; int best_k = -1;
-        for (int k = 0; k+1 < S; ++k) {
-            double d = delta(G[k], H[k], G[k+1], H[k+1], lam);
-            if (d > best_d) { best_d = d; best_k = k; }
-        }
-        if (best_k < 0) break;
-        G[best_k] += G[best_k+1]; H[best_k] += H[best_k+1];
-        cnt[best_k] += cnt[best_k+1]; last_bin[best_k] = last_bin[best_k+1];
-        for (int s = best_k+1; s < S-1; ++s) {
-            G[s]=G[s+1]; H[s]=H[s+1]; cnt[s]=cnt[s+1]; last_bin[s]=last_bin[s+1];
-        }
-        --S;
+    struct SB { double G, H; int orig_end, prev, next, ver; };
+    std::vector<SB> nd(S);
+    for (int i = 0; i < S; ++i)
+        nd[i] = {G_in[i], std::max(H_in[i], 1e-10), last_bin_in[i],
+                 i-1, (i+1 < S) ? i+1 : -1, 0};
+
+    // (delta, left_idx, left_ver, right_ver)
+    using E = std::tuple<double,int,int,int>;
+    std::priority_queue<E> pq;
+
+    auto push_pair = [&](int i) {
+        int j = nd[i].next; if (j < 0) return;
+        double d = delta(nd[i].G, nd[i].H, nd[j].G, nd[j].H, lam);
+        if (d > 0) pq.push({d, i, nd[i].ver, nd[j].ver});
+    };
+    for (int i = 0; i+1 < S; ++i) push_pair(i);
+
+    int cur_S = S;
+    while (cur_S > max_k && !pq.empty()) {
+        auto [d, li, lv, rv] = pq.top(); pq.pop();
+        int ri = nd[li].next;
+        // Lazy deletion: skip if either node was already re-merged
+        if (ri < 0 || nd[li].ver != lv || nd[ri].ver != rv) continue;
+
+        // Merge ri into li
+        nd[li].G += nd[ri].G; nd[li].H += nd[ri].H;
+        nd[li].orig_end = nd[ri].orig_end;
+        nd[li].ver++;
+        int rr = nd[ri].next;
+        nd[li].next = rr;
+        if (rr >= 0) nd[rr].prev = li;
+        --cur_S;
+
+        // Re-push only the two affected edges
+        if (nd[li].prev >= 0) push_pair(nd[li].prev);
+        push_pair(li);
     }
 
+    // Prefix scan over remaining superbins (linked list traversal)
     double G_clean = G_T - G_nan, H_clean = H_T - H_nan;
     double base = G_clean * G_clean / (H_clean + lam);
     double Gl = 0, Hl = 0;
     BHCResult best;
 
-    for (int s = 0; s < S-1; ++s) {
-        Gl += G[s]; Hl += H[s];
-        {   // NaN → left
-            double GLv=Gl+G_nan, HLv=Hl+H_nan, GRv=G_clean-Gl, HRv=H_clean-Hl;
+    for (int node = 0; nd[node].next >= 0; node = nd[node].next) {
+        Gl += nd[node].G; Hl += nd[node].H;
+        {   double GLv=Gl+G_nan, HLv=Hl+H_nan, GRv=G_clean-Gl, HRv=H_clean-Hl;
             if (HLv>=min_h && HRv>=min_h) {
-                double gain = GLv*GLv/(HLv+lam)+GRv*GRv/(HRv+lam)-base;
-                if (gain>best.gain) { best.gain=gain; best.best_bin=last_bin[s];
-                    best.Gl=GLv; best.Hl=HLv; best.Gr=GRv; best.Hr=HRv; best.nan_child=0; }
+                double g=GLv*GLv/(HLv+lam)+GRv*GRv/(HRv+lam)-base;
+                if (g>best.gain) { best={g,nd[node].orig_end,GLv,HLv,GRv,HRv,0}; }
             }
         }
-        {   // NaN → right
-            double GLv=Gl, HLv=Hl, GRv=G_clean-Gl+G_nan, HRv=H_clean-Hl+H_nan;
+        {   double GLv=Gl, HLv=Hl, GRv=G_clean-Gl+G_nan, HRv=H_clean-Hl+H_nan;
             if (HLv>=min_h && HRv>=min_h) {
-                double gain = GLv*GLv/(HLv+lam)+GRv*GRv/(HRv+lam)-base;
-                if (gain>best.gain) { best.gain=gain; best.best_bin=last_bin[s];
-                    best.Gl=GLv; best.Hl=HLv; best.Gr=GRv; best.Hr=HRv; best.nan_child=1; }
+                double g=GLv*GLv/(HLv+lam)+GRv*GRv/(HRv+lam)-base;
+                if (g>best.gain) { best={g,nd[node].orig_end,GLv,HLv,GRv,HRv,1}; }
             }
         }
     }
@@ -82,47 +107,49 @@ static SplitResult eval_split(
 {
     int D = ctx.D, B = ctx.B;
     std::vector<double> G(B), H_v(B);
-    std::vector<int> cnt(B), last_bin(B);
+    std::vector<int> last_bin(B);
     SplitResult best;
     double eff_lam = (bhc_lam > 0) ? bhc_lam : lam;
-    std::vector<int> cat_order(B);
 
     auto process_feat = [&](int f) {
-        const float* fbuf = hist.data() + (size_t)f * B * HSTRIDE;
-        bool is_cat_feat = ctx.is_cat[f];
-        double G_nan = fbuf[(B-1)*HSTRIDE+0], H_nan = fbuf[(B-1)*HSTRIDE+1];
+        const float* fb = hist.data() + (size_t)f * B * HSTRIDE;
+        bool is_cat_f = ctx.is_cat[f];
+        double G_nan = fb[(B-1)*HSTRIDE], H_nan = fb[(B-1)*HSTRIDE+1];
+
         int S = 0;
         for (int b = 0; b < B-1; ++b) {
-            double hb = fbuf[b*HSTRIDE+1];
+            double hb = fb[b*HSTRIDE+1];
             if (hb < 1e-12) continue;
-            G[S]=fbuf[b*HSTRIDE+0]; H_v[S]=hb;
-            cnt[S]=(int)fbuf[b*HSTRIDE+2]; last_bin[S]=b; ++S;
+            G[S]=fb[b*HSTRIDE]; H_v[S]=hb; last_bin[S]=b; ++S;
         }
         if (S < 2) return;
 
-        if (is_cat_feat) {
-            cat_order.resize(S);
-            std::iota(cat_order.begin(), cat_order.begin()+S, 0);
-            std::sort(cat_order.begin(), cat_order.begin()+S,
-                      [&](int a, int b_){ return G[a]/(cnt[a]+1e-9) < G[b_]/(cnt[b_]+1e-9); });
+        if (is_cat_f) {
+            // Sort by G/H (per-node, already local) — more principled than G/cnt
+            std::vector<int> ord(S); std::iota(ord.begin(), ord.end(), 0);
+            std::sort(ord.begin(), ord.end(),
+                      [&](int a, int b_){ return G[a]/(H_v[a]+1e-9) < G[b_]/(H_v[b_]+1e-9); });
+
             std::vector<double> Gs(S), Hs(S);
-            std::vector<int> cnts(S), orig_bins(S);
+            std::vector<int> sorted_pos(S), orig_bins(S);
             for (int i = 0; i < S; ++i) {
-                int si = cat_order[i];
-                Gs[i]=G[si]; Hs[i]=H_v[si]; cnts[i]=cnt[si]; orig_bins[i]=last_bin[si];
-                last_bin[i]=i;
+                int si = ord[i];
+                Gs[i]=G[si]; Hs[i]=H_v[si];
+                orig_bins[i]=last_bin[si]; sorted_pos[i]=i;
             }
-            auto r = bhc_split(Gs.data(), Hs.data(), cnts.data(), last_bin.data(), S,
+            auto r = bhc_split(Gs.data(), Hs.data(), sorted_pos.data(), S,
                                G_T, H_T, G_nan, H_nan, eff_lam, min_h, max_k);
             if (r.gain <= 0 || r.best_bin < 0 || r.gain <= best.gain) return;
+
             uint64_t mask = 0;
             for (int i = 0; i <= r.best_bin; ++i) mask |= (uint64_t(1) << orig_bins[i]);
             best = {true, true, r.gain, f, r.nan_child, r.best_bin, 0, mask,
                     r.Gl, r.Hl, r.Gr, r.Hr};
         } else {
-            auto r = bhc_split(G.data(), H_v.data(), cnt.data(), last_bin.data(), S,
+            auto r = bhc_split(G.data(), H_v.data(), last_bin.data(), S,
                                G_T, H_T, G_nan, H_nan, eff_lam, min_h, max_k);
             if (r.gain <= 0 || r.best_bin < 0 || r.gain <= best.gain) return;
+
             const auto& edg = ctx.edges[f];
             int ei = r.best_bin + 1;
             float thr = (ei < (int)edg.size()) ? edg[ei] : ctx.ax_min[f]+ctx.ax_range[f];
@@ -136,7 +163,7 @@ static SplitResult eval_split(
     return best;
 }
 
-// ── Routing ───────────────────────────────────────────────────────────────────
+// ── Routing & inference ───────────────────────────────────────────────────────
 
 static int route_sample(int sample_i, const SplitResult& sp, const BinCtx& ctx) {
     int b = ctx.code[(size_t)sample_i * ctx.D + sp.feature];
@@ -144,8 +171,6 @@ static int route_sample(int sample_i, const SplitResult& sp, const BinCtx& ctx) 
     if (sp.is_cat) return ((sp.cat_left_mask >> b) & 1) ? 0 : 1;
     return (b <= sp.best_bin) ? 0 : 1;
 }
-
-// ── Inference ─────────────────────────────────────────────────────────────────
 
 double Tree::predict_row(const float* x, int D) const {
     int cur = 0;
@@ -172,8 +197,7 @@ double Tree::predict_row(const float* x, int D) const {
 
 static void build_bin_ctx(const float* X, int n, int D,
                            const Params& params, BinCtx& ctx) {
-    int B_data = params.n_bins;
-    int B = B_data + 1;
+    int B_data = params.n_bins, B = B_data + 1;
     ctx.B=B; ctx.D=D; ctx.n=n;
     ctx.is_cat.assign(D, false);
     for (int f : params.cat_features) ctx.is_cat[f] = true;
@@ -187,7 +211,7 @@ static void build_bin_ctx(const float* X, int n, int D,
             std::unordered_map<float,int> cat_map;
             for (int i = 0; i < n; ++i) {
                 float v = X[(size_t)i*D+f];
-                if (!std::isnan(v) && !cat_map.count(v)) cat_map[v] = (int)cat_map.size();
+                if (!std::isnan(v) && !cat_map.count(v)) cat_map[v]=(int)cat_map.size();
             }
             std::vector<float> cats;
             cats.reserve(cat_map.size());
@@ -196,7 +220,7 @@ static void build_bin_ctx(const float* X, int n, int D,
             int C = std::min((int)cats.size(), B_data);
             ctx.cat_vals[f].resize(C);
             for (int k = 0; k < C; ++k) {
-                ctx.cat_vals[f][k] = cats[k];
+                ctx.cat_vals[f][k]=cats[k];
                 cat_map[cats[k]] = k < C-1 ? k : C-1;
             }
             for (int i = 0; i < n; ++i) {
@@ -221,15 +245,15 @@ static void build_bin_ctx(const float* X, int n, int D,
             }
             edges.push_back(std::numeric_limits<float>::max());
             edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
-            ctx.ax_min[f] = valid.front();
-            ctx.ax_range[f] = valid.back() > valid.front() ? valid.back()-valid.front() : 1.0f;
-            int B_real = (int)edges.size() - 1;
+            ctx.ax_min[f]=valid.front();
+            ctx.ax_range[f]=valid.back()>valid.front() ? valid.back()-valid.front() : 1.0f;
+            int B_real = (int)edges.size()-1;
             for (int i = 0; i < n; ++i) {
                 float v = X[(size_t)i*D+f];
-                if (std::isnan(v)) { ctx.code[(size_t)i*D+f] = (uint8_t)(B-1); continue; }
+                if (std::isnan(v)) { ctx.code[(size_t)i*D+f]=(uint8_t)(B-1); continue; }
                 auto it = std::upper_bound(edges.begin()+1, edges.end()-1, v);
                 int b = clamp((int)(it-(edges.begin()+1)), 0, B_real-1);
-                ctx.code[(size_t)i*D+f] = (uint8_t)b;
+                ctx.code[(size_t)i*D+f]=(uint8_t)b;
             }
         }
     }
@@ -243,9 +267,9 @@ static void accumulate_hist(const std::vector<int>& rows, const BinCtx& ctx,
     int D=ctx.D, B=ctx.B;
     out.assign((size_t)D*B*HSTRIDE, 0.0f);
     for (int i : rows) {
-        const uint8_t* ci = ctx.code.data() + (size_t)i*D;
+        const uint8_t* ci = ctx.code.data()+(size_t)i*D;
         for (int f = 0; f < D; ++f) {
-            float* sl = out.data() + ((size_t)f*B + ci[f])*HSTRIDE;
+            float* sl = out.data()+((size_t)f*B+ci[f])*HSTRIDE;
             sl[0]+=(float)g[i]; sl[1]+=(float)h[i]; sl[2]+=1.0f;
         }
     }
@@ -255,7 +279,7 @@ static void subtract_hist(const std::vector<float>& parent,
                            const std::vector<float>& child,
                            std::vector<float>& sibling) {
     sibling.resize(parent.size());
-    for (size_t i = 0; i < parent.size(); ++i) sibling[i] = parent[i] - child[i];
+    for (size_t i = 0; i < parent.size(); ++i) sibling[i]=parent[i]-child[i];
 }
 
 // ── Tree builder ──────────────────────────────────────────────────────────────
@@ -267,79 +291,84 @@ static Tree build_tree(const BinCtx& ctx,
                         std::vector<int>& split_ks,
                         std::mt19937& rng) {
     Tree tree;
-    int max_nodes = 2 * params.max_leaves + 4;
+    int max_nodes = 2*params.max_leaves+4;
     tree.nodes.resize(max_nodes);
-    tree.cat_vals = ctx.cat_vals;
-    tree.is_cat   = ctx.is_cat;
-    tree.B = ctx.B;
+    tree.cat_vals=ctx.cat_vals; tree.is_cat=ctx.is_cat; tree.B=ctx.B;
 
-    int D = ctx.D;
-    double lam = params.reg_lambda, bhc_lam = params.bhc_lam;
-    double min_h = params.min_child_weight, gamma = params.gamma;
+    int D=ctx.D;
+    double lam=params.reg_lambda, bhc_lam=params.bhc_lam;
+    double min_h=params.min_child_weight, gamma=params.gamma;
 
     std::vector<int> feat_subset;
     if (params.colsample_bytree < 1.0) {
         std::vector<int> all(D); std::iota(all.begin(), all.end(), 0);
         std::shuffle(all.begin(), all.end(), rng);
-        int ns = std::max(1, (int)(D*params.colsample_bytree));
+        int ns=std::max(1,(int)(D*params.colsample_bytree));
         feat_subset.assign(all.begin(), all.begin()+ns);
         std::sort(feat_subset.begin(), feat_subset.end());
     }
 
-    struct NodeState { std::vector<int> rows; std::vector<float> hist; double G_T=0,H_T=0; };
+    struct NodeState {
+        std::vector<int> rows; std::vector<float> hist;
+        double G_T=0, H_T=0; int depth=0;
+    };
     std::vector<NodeState> nstate(max_nodes);
 
-    nstate[0].rows = sub;
+    nstate[0].rows=sub; nstate[0].depth=0;
     accumulate_hist(sub, ctx, g, h, nstate[0].hist);
     double G_root=0, H_root=0;
-    for (int i : sub) { G_root+=g[i]; H_root+=h[i]; }
+    for (int i:sub) { G_root+=g[i]; H_root+=h[i]; }
     nstate[0].G_T=G_root; nstate[0].H_T=H_root;
-    tree.nodes[0].value = -G_root/(H_root+lam);
+    tree.nodes[0].value=-G_root/(H_root+lam);
 
-    using PQ = std::priority_queue<std::pair<double,int>>;
+    using PQ=std::priority_queue<std::pair<double,int>>;
     PQ frontier;
 
-    auto enqueue = [&](int t) {
-        if ((int)nstate[t].rows.size() < 4) return;
-        auto sp = eval_split(nstate[t].hist, ctx,
-                             nstate[t].G_T, nstate[t].H_T,
-                             lam, bhc_lam, min_h, params.max_k, feat_subset);
-        if (!sp.valid || sp.gain <= gamma) return;
-        tree.nodes[t].split = sp;
+    auto enqueue=[&](int t) {
+        if ((int)nstate[t].rows.size()<4) return;
+        // Adaptive lambda: decay by depth (no-op if lambda_depth_decay==1.0)
+        double eff_lam = lam*std::pow(params.lambda_depth_decay, nstate[t].depth);
+        auto sp=eval_split(nstate[t].hist, ctx,
+                           nstate[t].G_T, nstate[t].H_T,
+                           eff_lam, bhc_lam, min_h, params.max_k, feat_subset);
+        if (!sp.valid || sp.gain<=gamma) return;
+        tree.nodes[t].split=sp;
         frontier.push({sp.gain, t});
     };
     enqueue(0);
 
-    int next_id = 1, splits_left = params.max_leaves - 1;
-    while (splits_left > 0 && !frontier.empty()) {
-        auto [gain, t] = frontier.top(); frontier.pop();
+    int next_id=1, splits_left=params.max_leaves-1;
+    while (splits_left>0 && !frontier.empty()) {
+        auto [gain, t]=frontier.top(); frontier.pop();
         if (!tree.nodes[t].is_leaf) continue;
-        SplitResult& sp = tree.nodes[t].split;
-        if (!sp.valid || sp.gain <= 0) continue;
+        SplitResult& sp=tree.nodes[t].split;
+        if (!sp.valid || sp.gain<=0) continue;
+        if (nstate[t].depth>=params.max_depth) continue;
 
-        int depth = 0; { int cur=t; while (cur>0){cur=(cur-1)/2; ++depth;} }
-        if (depth >= params.max_depth) continue;
+        int tl=next_id++, tr=next_id++;
+        if (next_id>max_nodes) break;
 
-        int tl = next_id++, tr = next_id++;
-        if (next_id > max_nodes) break;
+        for (int i:nstate[t].rows)
+            (route_sample(i,sp,ctx)==0 ? nstate[tl]:nstate[tr]).rows.push_back(i);
 
-        for (int i : nstate[t].rows) {
-            (route_sample(i,sp,ctx)==0 ? nstate[tl] : nstate[tr]).rows.push_back(i);
-        }
-        if (nstate[tl].rows.empty() || nstate[tr].rows.empty()) {
+        if (nstate[tl].rows.empty()||nstate[tr].rows.empty()) {
             --next_id; --next_id;
             nstate[tl].rows.clear(); nstate[tr].rows.clear(); continue;
         }
 
-        bool ls = nstate[tl].rows.size() <= nstate[tr].rows.size();
-        int ts = ls?tl:tr, tl2 = ls?tr:tl;
+        bool ls=nstate[tl].rows.size()<=nstate[tr].rows.size();
+        int ts=ls?tl:tr, tl2=ls?tr:tl;
         accumulate_hist(nstate[ts].rows, ctx, g, h, nstate[ts].hist);
         subtract_hist(nstate[t].hist, nstate[ts].hist, nstate[tl2].hist);
 
-        for (int i : nstate[tl].rows) { nstate[tl].G_T+=g[i]; nstate[tl].H_T+=h[i]; }
-        for (int i : nstate[tr].rows) { nstate[tr].G_T+=g[i]; nstate[tr].H_T+=h[i]; }
-        tree.nodes[tl].value = -nstate[tl].G_T/(nstate[tl].H_T+lam);
-        tree.nodes[tr].value = -nstate[tr].G_T/(nstate[tr].H_T+lam);
+        for (int i:nstate[tl].rows) { nstate[tl].G_T+=g[i]; nstate[tl].H_T+=h[i]; }
+        for (int i:nstate[tr].rows) { nstate[tr].G_T+=g[i]; nstate[tr].H_T+=h[i]; }
+        tree.nodes[tl].value=-nstate[tl].G_T/(nstate[tl].H_T+lam);
+        tree.nodes[tr].value=-nstate[tr].G_T/(nstate[tr].H_T+lam);
+
+        // Track depth properly (not (cur-1)/2 hack)
+        nstate[tl].depth=nstate[t].depth+1;
+        nstate[tr].depth=nstate[t].depth+1;
 
         tree.nodes[t].is_leaf=false; tree.nodes[t].left=tl; tree.nodes[t].right=tr;
         split_ks.push_back(2); --splits_left;
@@ -348,7 +377,7 @@ static Tree build_tree(const BinCtx& ctx,
         enqueue(tl); enqueue(tr);
     }
 
-    tree.nodes.resize(next_id > 0 ? next_id : 1);
+    tree.nodes.resize(next_id>0?next_id:1);
     return tree;
 }
 
@@ -358,31 +387,31 @@ void BRSTBoost::fit(const float* X, int n, int D, const int* y, Params params) {
     lam_=params.reg_lambda; lr_=params.learning_rate;
     build_bin_ctx(X, n, D, params, ctx_);
     int n_pos=0; for (int i=0;i<n;++i) n_pos+=y[i];
-    double p0 = clamp((double)n_pos/n, 1e-6, 1.0-1e-6);
-    base_score_ = std::log(p0/(1.0-p0));
-    std::vector<double> F(n, base_score_), gvec(n), hvec(n);
+    double p0=clamp((double)n_pos/n, 1e-6, 1.0-1e-6);
+    base_score_=std::log(p0/(1.0-p0));
+    std::vector<double> F(n,base_score_), gvec(n), hvec(n);
     trees_.clear(); trees_.reserve(params.n_estimators);
     split_ks_.clear();
     std::mt19937 rng(params.random_state);
-    for (int t = 0; t < params.n_estimators; ++t) {
+    for (int t=0; t<params.n_estimators; ++t) {
         for (int i=0;i<n;++i) { double p=sigmoid(F[i]); gvec[i]=p-y[i]; hvec[i]=p*(1-p); }
         std::vector<int> sub;
-        if (params.subsample < 1.0) {
+        if (params.subsample<1.0) {
             sub.resize(n); std::iota(sub.begin(),sub.end(),0);
             std::shuffle(sub.begin(),sub.end(),rng);
             sub.resize((int)(n*params.subsample));
         } else { sub.resize(n); std::iota(sub.begin(),sub.end(),0); }
-        Tree tree = build_tree(ctx_, gvec.data(), hvec.data(), sub, params, split_ks_, rng);
-        for (int i=0;i<n;++i) F[i] += lr_*tree.predict_row(X+(size_t)i*D, D);
+        Tree tree=build_tree(ctx_, gvec.data(), hvec.data(), sub, params, split_ks_, rng);
+        for (int i=0;i<n;++i) F[i]+=lr_*tree.predict_row(X+(size_t)i*D, D);
         trees_.push_back(std::move(tree));
     }
 }
 
 void BRSTBoost::predict_proba(const float* X, int n, int D, double* out_p1) const {
     std::fill(out_p1, out_p1+n, base_score_);
-    for (const Tree& tree : trees_)
-        for (int i=0;i<n;++i) out_p1[i] += lr_*tree.predict_row(X+(size_t)i*D, D);
-    for (int i=0;i<n;++i) out_p1[i] = sigmoid(out_p1[i]);
+    for (const Tree& t:trees_)
+        for (int i=0;i<n;++i) out_p1[i]+=lr_*t.predict_row(X+(size_t)i*D, D);
+    for (int i=0;i<n;++i) out_p1[i]=sigmoid(out_p1[i]);
 }
 
 double BRSTBoost::avg_k() const {

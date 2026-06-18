@@ -21,26 +21,27 @@ _lib.brst_free.argtypes = [ctypes.c_void_p]
 
 _lib.brst_fit.restype  = None
 _lib.brst_fit.argtypes = [
-    ctypes.c_void_p,                    # handle
-    ctypes.POINTER(ctypes.c_float),     # X
-    ctypes.c_int,                       # n
-    ctypes.c_int,                       # D
-    ctypes.POINTER(ctypes.c_int),       # y
-    ctypes.c_int,                       # n_estimators
-    ctypes.c_double,                    # learning_rate
-    ctypes.c_int,                       # max_depth
-    ctypes.c_int,                       # max_leaves
-    ctypes.c_double,                    # reg_lambda
-    ctypes.c_double,                    # bhc_lam
-    ctypes.c_double,                    # subsample
-    ctypes.c_double,                    # colsample_bytree
-    ctypes.c_int,                       # n_bins
-    ctypes.c_double,                    # min_child_weight
-    ctypes.c_double,                    # gamma
-    ctypes.c_int,                       # max_k
-    ctypes.POINTER(ctypes.c_int),       # cat_features
-    ctypes.c_int,                       # n_cat_features
-    ctypes.c_int,                       # random_state
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),  # X
+    ctypes.c_int,                    # n
+    ctypes.c_int,                    # D
+    ctypes.POINTER(ctypes.c_int),    # y
+    ctypes.c_int,                    # n_estimators
+    ctypes.c_double,                 # learning_rate
+    ctypes.c_int,                    # max_depth
+    ctypes.c_int,                    # max_leaves
+    ctypes.c_double,                 # reg_lambda
+    ctypes.c_double,                 # bhc_lam
+    ctypes.c_double,                 # subsample
+    ctypes.c_double,                 # colsample_bytree
+    ctypes.c_int,                    # n_bins
+    ctypes.c_double,                 # min_child_weight
+    ctypes.c_double,                 # gamma
+    ctypes.c_int,                    # max_k
+    ctypes.c_double,                 # lambda_depth_decay
+    ctypes.POINTER(ctypes.c_int),    # cat_features
+    ctypes.c_int,                    # n_cat_features
+    ctypes.c_int,                    # random_state
 ]
 
 _lib.brst_predict_proba.restype  = None
