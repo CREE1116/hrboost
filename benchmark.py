@@ -1,24 +1,23 @@
 """
-BRSTBoost vs LightGBM / XGBoost / CatBoost — AUC benchmark.
+BRSTBoost vs LightGBM / XGBoost / CatBoost — AUC benchmark via JSON parameters.
 
 Usage:
-    uv run python benchmark.py            # all synthetic + adult
-    uv run python benchmark.py --quick    # fast: small n, no adult
-    uv run python benchmark.py --no-adult # synth only, full n
+    uv run python benchmark.py --params best_params.json
+    uv run python benchmark.py --quick
 """
-import sys, time, argparse
+import sys, time, argparse, json, os
+import warnings
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 sys.path.insert(0, "python")
 
 import numpy as np
 import pandas as pd
-from sklearn.datasets import (make_classification, make_moons,
-                               make_circles, make_blobs)
+from sklearn.datasets import load_breast_cancer, fetch_openml
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
-from sklearn.utils import shuffle as sk_shuffle
 
-from brstboost import BRSTBoost
+from hrboost import HRBoostClassifier
 
 # ── optional competitors ───────────────────────────────────────────────────────
 
@@ -30,60 +29,40 @@ lgb = _try("lightgbm")
 xgb = _try("xgboost")
 cb  = _try("catboost")
 
-# ── synthetic dataset zoo ─────────────────────────────────────────────────────
+# ── real dataset zoo ──────────────────────────────────────────────────────────
 
-def _ds_classification(n, D=30, seed=0):
-    X, y = make_classification(n, D, n_informative=15, n_redundant=5,
-                                random_state=seed)
-    return X.astype(np.float32), y.astype(np.int32), "class-D30"
+def load_breast_cancer_ds():
+    data = load_breast_cancer()
+    return data.data.astype(np.float32), data.target.astype(np.int32), "breast_cancer"
 
-def _ds_highdim(n, D=100, seed=0):
-    X, y = make_classification(n, D, n_informative=8, n_redundant=2,
-                                n_repeated=0, random_state=seed)
-    return X.astype(np.float32), y.astype(np.int32), "class-D100-sparse"
+def load_diabetes():
+    try:
+        data = fetch_openml(data_id=37, as_frame=True, parser='auto')
+        X = data.data.to_numpy().astype(np.float32)
+        y = (data.target == 'tested_positive').astype(np.int32).to_numpy()
+        return X, y, "diabetes"
+    except Exception as e:
+        print(f"  [diabetes load failed: {e}]")
+        return None
 
-def _ds_moons(n, seed=0):
-    X, y = make_moons(n, noise=0.25, random_state=seed)
-    return X.astype(np.float32), y.astype(np.int32), "moons"
-
-def _ds_circles(n, seed=0):
-    X, y = make_circles(n, noise=0.1, factor=0.5, random_state=seed)
-    return X.astype(np.float32), y.astype(np.int32), "circles"
-
-def _ds_imbalanced(n, seed=0):
-    X, y = make_classification(n, 30, n_informative=15, n_redundant=5,
-                                weights=[0.9, 0.1], random_state=seed)
-    return X.astype(np.float32), y.astype(np.int32), "imbalanced-90/10"
-
-def _ds_blobs(n, seed=0):
-    centers = np.array([[-3, 0], [3, 0], [0, 3], [0, -3]], dtype=np.float32)
-    X, lbl = make_blobs(n, centers=centers, cluster_std=1.2, random_state=seed)
-    y = (lbl % 2).astype(np.int32)
-    X = X.astype(np.float32)
-    return X, y, "blobs-4cluster"
-
-def _ds_mixed_cat(n, seed=0):
-    rng = np.random.default_rng(seed)
-    X_num, y = make_classification(n, 10, n_informative=7, random_state=seed)
-    X_num = X_num.astype(np.float32)
-    cat1 = rng.integers(0, 5, n).astype(np.float32).reshape(-1, 1)
-    cat2 = rng.integers(0, 10, n).astype(np.float32).reshape(-1, 1)
-    X = np.hstack([X_num, cat1, cat2])
-    return X, y.astype(np.int32), "mixed-cat", [10, 11]
-
-def synthetic_suite(quick=False):
-    n = 5_000 if quick else 20_000
-    return [
-        _ds_classification(n),
-        _ds_highdim(n),
-        _ds_moons(n),
-        _ds_circles(n),
-        _ds_imbalanced(n),
-        _ds_blobs(n),
-        _ds_mixed_cat(n),
-    ]
-
-# ── adult (real) ──────────────────────────────────────────────────────────────
+def load_credit_g():
+    try:
+        data = fetch_openml(data_id=31, as_frame=True, parser='auto')
+        df_X = data.data.copy()
+        y = (data.target == 'good').astype(np.int32).to_numpy()
+        
+        cat_idx = []
+        for i, col in enumerate(df_X.columns):
+            if df_X[col].dtype.name == 'category' or df_X[col].dtype == object:
+                cat_idx.append(i)
+                le = LabelEncoder()
+                df_X[col] = le.fit_transform(df_X[col].astype(str))
+                
+        X = df_X.to_numpy().astype(np.float32)
+        return X, y, "credit-g", cat_idx
+    except Exception as e:
+        print(f"  [credit-g load failed: {e}]")
+        return None
 
 def load_adult():
     url = ("https://archive.ics.uci.edu/ml/machine-learning-databases/"
@@ -92,64 +71,91 @@ def load_adult():
             "occupation","relationship","race","sex","cap_gain","cap_loss",
             "hours","country","income"]
     try:
-        df = pd.read_csv(url, header=None, names=cols, na_values=" ?",
+        df = pd.read_csv(url, header=None, names=cols, na_values="?",
                          skipinitialspace=True)
     except Exception as e:
-        print(f"  [adult load failed: {e}]"); return None
-    df = df.dropna()
+        print(f"  [adult load failed: {e}]")
+        return None
     y = (df["income"].str.strip() == ">50K").astype(int).values
     df = df.drop("income", axis=1)
     for c in df.select_dtypes("object").columns:
-        df[c] = LabelEncoder().fit_transform(df[c].astype(str))
+        s = pd.Series(np.nan, index=df.index, dtype=np.float32)
+        non_null_mask = df[c].notnull()
+        if non_null_mask.any():
+            le = LabelEncoder()
+            s.loc[non_null_mask] = le.fit_transform(df.loc[non_null_mask, c].astype(str)).astype(np.float32)
+        df[c] = s
     X = df.values.astype(np.float32)
     cat_idx = [i for i, c in enumerate(df.columns)
-               if df[c].nunique() < 50 and c not in
+               if df[c].nunique(dropna=True) < 50 and c not in
                ("age","fnlwgt","edu_num","cap_gain","cap_loss","hours")]
     return X, y.astype(np.int32), "adult", cat_idx
 
-# ── model factory ─────────────────────────────────────────────────────────────
+# ── model factory with JSON injector ──────────────────────────────────────────
 
-def make_models(cat_features=None, quick=False):
+def make_models(ds_name, hpo_dict=None, cat_features=None, quick=False):
     cat = cat_features or []
     est = 200 if quick else 400
     lr  = 0.1  if quick else 0.05
     models = {}
+    
+    # 해당 데이터셋의 HPO 서브 세트 추출 시도
+    ds_hpo = hpo_dict.get(ds_name, {}) if hpo_dict else {}
 
-    nbins = 64 if quick else 255
-    models["BRSTBoost"] = BRSTBoost(
-        n_estimators=est, learning_rate=lr, max_depth=5, max_leaves=64,
-        reg_lambda=1.0, subsample=0.8, colsample_bytree=0.8,
-        n_bins=nbins, max_k=2, cat_features=cat, random_state=0)
+    # 1. SelfCDSB
+    sc_params = {
+        "n_estimators": est, "learning_rate": lr, "max_depth": 5, "max_leaves": 31,
+        "reg_lambda": 1.0, "subsample": 0.8, "colsample_bytree": 1.0, "n_bins": 255,
+        "cat_features": cat, "random_state": 0, "objective": "binary", "verbose": False
+    }
+    if "SelfCDSB" in ds_hpo:
+        sc_hpo = ds_hpo["SelfCDSB"].copy()
+        sc_hpo.pop("cdsb_alpha", None)
+        sc_params.update(sc_hpo)
+    elif "HRBoost" in ds_hpo:
+        sc_hpo = ds_hpo["HRBoost"].copy()
+        sc_params.update(sc_hpo)
+    models["HRBoost"] = HRBoostClassifier(**sc_params)
 
+    # 2. LightGBM
     if lgb:
         lgb_kw = dict(n_estimators=est, learning_rate=lr, max_depth=5,
                       num_leaves=31, subsample=0.8, colsample_bytree=0.8,
                       reg_lambda=1.0, random_state=0, verbose=-1)
         if cat:
             lgb_kw["categorical_feature"] = cat
+        if "LightGBM" in ds_hpo:
+            lgb_kw.update(ds_hpo["LightGBM"])
         models["LightGBM"] = lgb.LGBMClassifier(**lgb_kw)
 
+    # 3. XGBoost
     if xgb:
-        models["XGBoost"] = xgb.XGBClassifier(
-            n_estimators=est, learning_rate=lr, max_depth=5,
-            subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
-            eval_metric="logloss", random_state=0, verbosity=0)
+        xgb_kw = dict(n_estimators=est, learning_rate=lr, max_depth=5,
+                      subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+                      eval_metric="logloss", random_state=0, verbosity=0)
+        if "XGBoost" in ds_hpo:
+            xgb_kw.update(ds_hpo["XGBoost"])
+        models["XGBoost"] = xgb.XGBClassifier(**xgb_kw)
 
+    # 4. CatBoost
     if cb:
         cb_kw = dict(iterations=est, learning_rate=lr, depth=5,
                      l2_leaf_reg=1.0, subsample=0.8,
                      random_state=0, verbose=False)
+        if "CatBoost" in ds_hpo:
+            cb_kw.update(ds_hpo["CatBoost"])
         if cat:
             cb_kw["cat_features"] = cat
+            
         _inner_cb = cb.CatBoostClassifier(**cb_kw)
-        # CatBoost rejects float arrays with cat_features; use DataFrame + str cat cols
+        
         class _CBWrap:
             def __init__(self, m, cat_idx):
                 self._m = m; self._cat = cat_idx
             def _prep(self, X):
                 df = pd.DataFrame(X)
                 for c in self._cat:
-                    df[c] = df[c].astype(int).astype(str)
+                    df[c] = df[c].map(lambda v: 'nan' if np.isnan(v) else str(int(v)))
                 return df
             def fit(self, X, y):
                 self._m.fit(self._prep(X), y); return self
@@ -164,16 +170,22 @@ def make_models(cat_features=None, quick=False):
 HDR = f"  {'Model':<12} {'AUC':>8} {'±':>6} {'fit/fold':>9}"
 SEP = "  " + "─"*12 + " " + "─"*8 + " " + "─"*6 + " " + "─"*9
 
-def evaluate(X, y, name, cat_features=None, n_splits=5, quick=False):
+def evaluate(X, y, name, hpo_dict=None, cat_features=None, n_splits=5, quick=False):
     print(f"\n{'─'*58}")
     print(f"  {name}  n={len(y):,}  D={X.shape[1]}  pos={y.mean():.3f}")
+    
+    # HPO 설정 주입 유무 피드백
+    if hpo_dict and name in hpo_dict:
+        print(f"  [Status] Using Optimized HPO Hyperparameters from JSON")
+    else:
+        print(f"  [Status] Using Default Baseline Hyperparameters")
+        
     print(f"{'─'*58}")
     print(HDR); print(SEP)
 
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    results = {}
 
-    for mname, model in make_models(cat_features, quick=quick).items():
+    for mname, model in make_models(name, hpo_dict, cat_features, quick=quick).items():
         aucs, times = [], []
         for tr, te in cv.split(X, y):
             t0 = time.time()
@@ -184,122 +196,50 @@ def evaluate(X, y, name, cat_features=None, n_splits=5, quick=False):
             aucs.append(roc_auc_score(y[te], p))
 
         mu, sd = np.mean(aucs), np.std(aucs)
-        results[mname] = mu
         print(f"  {mname:<12} {mu:>8.4f} {sd:>6.4f} {np.mean(times):>8.1f}s")
-
-    return results
-
-# ── decision boundary ─────────────────────────────────────────────────────────
-
-BOUNDARY_DATASETS = [
-    ("moons",   lambda: make_moons(1500, noise=0.2, random_state=0)),
-    ("circles", lambda: make_circles(1500, noise=0.08, factor=0.5, random_state=0)),
-    ("blobs",   lambda: (
-        lambda X, lbl: (X.astype(np.float32), (lbl % 2).astype(np.int32)))(
-        *make_blobs(1500, centers=np.array([[-2,0],[2,0],[0,2],[0,-2]]),
-                    cluster_std=0.9, random_state=0))),
-    ("class2d", lambda: make_classification(
-        1500, 2, n_informative=2, n_redundant=0,
-        n_clusters_per_class=2, random_state=1)),
-]
-
-def plot_boundary():
-    import matplotlib.pyplot as plt
-
-    n_ds = len(BOUNDARY_DATASETS)
-    n_models_est = 1 + bool(lgb) + bool(xgb) + bool(cb)
-
-    fig, axes = plt.subplots(n_ds, n_models_est,
-                             figsize=(4.5 * n_models_est, 4 * n_ds),
-                             squeeze=False)
-
-    h = 0.05
-
-    for row, (ds_name, ds_fn) in enumerate(BOUNDARY_DATASETS):
-        X_raw, y_raw = ds_fn()
-        X2 = np.ascontiguousarray(X_raw, dtype=np.float32)
-        y2 = np.ascontiguousarray(y_raw, dtype=np.int32)
-
-        x0, x1 = X2[:, 0], X2[:, 1]
-        xx, yy = np.meshgrid(
-            np.arange(x0.min() - .5, x0.max() + .5, h),
-            np.arange(x1.min() - .5, x1.max() + .5, h))
-        grid = np.c_[xx.ravel(), yy.ravel()].astype(np.float32)
-
-        model_list = [
-            ("BRSTBoost", BRSTBoost(n_estimators=200, learning_rate=0.1,
-                                    max_depth=5, max_leaves=64,
-                                    reg_lambda=1.0, colsample_bytree=0.8,
-                                    n_bins=32, random_state=0)),
-        ]
-        if lgb:
-            model_list.append(("LightGBM", lgb.LGBMClassifier(
-                n_estimators=200, learning_rate=0.1, max_depth=5,
-                num_leaves=31, verbose=-1, random_state=0)))
-        if xgb:
-            model_list.append(("XGBoost", xgb.XGBClassifier(
-                n_estimators=200, learning_rate=0.1, max_depth=5,
-                eval_metric="logloss", verbosity=0, random_state=0)))
-        if cb:
-            model_list.append(("CatBoost", cb.CatBoostClassifier(
-                iterations=200, learning_rate=0.1, depth=5,
-                random_state=0, verbose=False)))
-
-        for col, (mname, model) in enumerate(model_list):
-            ax = axes[row][col]
-            model.fit(X2, y2)
-            Z = model.predict_proba(grid)[:, 1].reshape(xx.shape)
-            cf = ax.contourf(xx, yy, Z, levels=50, cmap="RdBu_r",
-                             alpha=0.75, vmin=0, vmax=1)
-            ax.contour(xx, yy, Z, levels=[0.5], colors="k", linewidths=1.5)
-            ax.scatter(x0[y2==0], x1[y2==0], s=5, c="royalblue", alpha=0.4)
-            ax.scatter(x0[y2==1], x1[y2==1], s=5, c="tomato",    alpha=0.4)
-            auc = roc_auc_score(y2, model.predict_proba(X2)[:, 1])
-            ax.set_title(f"{mname}  AUC={auc:.3f}", fontsize=9)
-            if row == 0:
-                ax.set_title(f"{mname}\n(AUC={auc:.3f})", fontsize=9)
-            ax.set_xlabel(ds_name if col == 0 else "")
-
-    plt.tight_layout()
-    out = "decision_boundary.png"
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    print(f"Saved: {out}")
-    plt.close()
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--quick",    action="store_true",
-                    help="Small n (5k), fewer estimators, no adult")
-    ap.add_argument("--no-adult", action="store_true",
-                    help="Skip adult dataset but use full n")
-    ap.add_argument("--no-boundary", action="store_true",
-                    help="Skip decision boundary plots")
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--params", type=str, default="best_params.json",
+                    help="Path to the JSON file containing optimized params")
     args = ap.parse_args()
 
-    print("BRSTBoost benchmark")
-    print(f"  LightGBM={'yes' if lgb else 'no'}  "
-          f"XGBoost={'yes' if xgb else 'no'}  "
-          f"CatBoost={'yes' if cb else 'no'}")
+    print("Self-CDSB Benchmark (Real Datasets Integration)")
+    
+    # JSON 로드 시도
+    hpo_dict = None
+    if os.path.exists(args.params):
+        try:
+            with open(args.params, "r", encoding="utf-8") as f:
+                hpo_dict = json.load(f)
+            print(f"  Loaded hyperparameter configurations from: {args.params}")
+        except Exception as e:
+            print(f"  [Warning] Failed to read JSON ({e}). Falling back to baseline.")
+    else:
+        print(f"  [Info] '{args.params}' file not found. Running with baseline parameters.")
 
-    for entry in synthetic_suite(quick=args.quick):
+    datasets = []
+    datasets.append(load_breast_cancer_ds())
+
+    db_data = load_diabetes()
+    if db_data: datasets.append(db_data)
+
+    cr_data = load_credit_g()
+    if cr_data: datasets.append(cr_data)
+
+    adult_data = load_adult()
+    if adult_data: datasets.append(adult_data)
+
+    for entry in datasets:
         if len(entry) == 4:
             X, y, name, cat = entry
-            evaluate(X, y, name, cat_features=cat, quick=args.quick)
+            evaluate(X, y, name, hpo_dict=hpo_dict, cat_features=cat, quick=args.quick)
         else:
             X, y, name = entry
-            evaluate(X, y, name, quick=args.quick)
-
-    if not args.no_boundary:
-        print("\nPlotting decision boundaries…")
-        plot_boundary()
-
-    if not args.quick and not args.no_adult:
-        result = load_adult()
-        if result:
-            X_a, y_a, name_a, cats_a = result
-            evaluate(X_a, y_a, name_a, cat_features=cats_a)
+            evaluate(X, y, name, hpo_dict=hpo_dict, quick=args.quick)
 
 if __name__ == "__main__":
     main()

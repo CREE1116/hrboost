@@ -1,6 +1,6 @@
 CXX      := clang++
-CXXFLAGS := -std=c++17 -O3 -march=native -ffast-math -fPIC -DNDEBUG
-SRC      := src/brstboost.cpp src/capi.cpp
+CXXFLAGS := -std=c++17 -O3 -march=native -fPIC -DNDEBUG
+SRC      := src/hrboost.cpp src/capi_hrboost.cpp
 
 # Detect OS
 UNAME := $(shell uname)
@@ -12,11 +12,11 @@ else
     LDFLAGS := -shared
 endif
 
-LIB := libbrstboost.$(EXT)
+LIB := libhrboost.$(EXT)
 
 all: $(LIB)
 
-$(LIB): $(SRC) src/brstboost.h src/capi.h
+$(LIB): $(SRC) src/hrboost.h src/capi_hrboost.h
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -Isrc -o $@ $(SRC)
 
 clean:

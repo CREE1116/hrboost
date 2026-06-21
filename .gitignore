@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# C++ builds & Shared libraries (build locally, do not push to git)
+build/
+*.so
+*.dylib
+*.dll
+
+# OS files
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Scratch & Temporary testing scripts
+temp*.py
+hpo.py
+catboost_info/
+best_params.json
+*.png
+walkthrough.md
+implementation_plan.md
+task.md
+ablation_analysis.md
+adult_performance_analysis.md
+advanced_binning_analysis.md
+algorithm_specification.md
+bhc_improvements_analysis.md
+bhc_mechanism_analysis.md
+cohesion_dynamic_regularization_analysis.md
+criticism_verification.md
+fisher_scan_vs_bhc_analysis.md
+implementation_details.md
+multiclass_bhc_verification.md
+multiclass_native_vision.md
+multiclass_openml_benchmark.md
+multiclass_openml_benchmark_expanded.md
+our_model_differentiation.md
+prediction_correlation_analysis.md
+self_cdsb_mechanism.md
+이론.md
