@@ -12,6 +12,7 @@ import json
 import os
 import warnings
 warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # Configure library paths
 sys.path.insert(0, "python")
@@ -80,12 +81,19 @@ def load_openml_by_id(data_id, name, is_binary=True, cat_index=None):
 
 # Wrapper for CatBoost
 class CatBoostWrapper:
-    def __init__(self, is_multiclass, num_classes, cat_idx, est, lr):
+    def __init__(self, is_multiclass, cat_idx, params):
         self.cat_idx = cat_idx
         loss_fn = "MultiClass" if is_multiclass else "Logloss"
         self.model = cb.CatBoostClassifier(
-            iterations=est, learning_rate=lr, depth=5,
-            loss_function=loss_fn, random_seed=0, verbose=False,
+            iterations=params.get("iterations", 100),
+            learning_rate=params.get("learning_rate", 0.1),
+            depth=params.get("depth", 5),
+            l2_leaf_reg=params.get("l2_leaf_reg", 3.0),
+            subsample=params.get("subsample", 0.8),
+            bootstrap_type=params.get("bootstrap_type", "Bernoulli"),
+            loss_function=loss_fn,
+            random_seed=0,
+            verbose=False,
             cat_features=cat_idx if cat_idx else None
         )
         
@@ -158,8 +166,9 @@ def make_models(ds_name, num_classes, hpo_dict=None, cat_features=None, quick=Fa
         lgb_kw = dict(n_estimators=est, learning_rate=lr, max_depth=5,
                       num_leaves=31, subsample=0.8, colsample_bytree=0.8,
                       reg_lambda=1.0, random_state=0, verbose=-1)
-        if cat:
-            lgb_kw["categorical_feature"] = cat
+        lgb_hpo = ds_hpo.get("LightGBM", {})
+        if lgb_hpo:
+            lgb_kw.update(lgb_hpo)
         models["LightGBM"] = lgb.LGBMClassifier(**lgb_kw)
 
     # 3. XGBoost
@@ -172,12 +181,19 @@ def make_models(ds_name, num_classes, hpo_dict=None, cat_features=None, quick=Fa
             xgb_kw["num_class"] = num_classes
         else:
             xgb_kw["eval_metric"] = "logloss"
-            
+        xgb_hpo = ds_hpo.get("XGBoost", {})
+        if xgb_hpo:
+            xgb_kw.update(xgb_hpo)
         models["XGBoost"] = xgb.XGBClassifier(**xgb_kw)
 
     # 4. CatBoost
     if cb:
-        models["CatBoost"] = CatBoostWrapper(is_multi, num_classes, cat, est, lr)
+        cb_kw = dict(iterations=est, learning_rate=lr, depth=5,
+                     l2_leaf_reg=3.0, subsample=0.8, bootstrap_type="Bernoulli")
+        cb_hpo = ds_hpo.get("CatBoost", {})
+        if cb_hpo:
+            cb_kw.update(cb_hpo)
+        models["CatBoost"] = CatBoostWrapper(is_multi, cat, cb_kw)
 
     return models
 
