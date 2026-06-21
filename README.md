@@ -8,30 +8,39 @@ HRBoost is 100% compliant with the `scikit-learn` API, offering both `HRBoostCla
 
 ## Technical Moat: How It Works
 
-HRBoost derives its name from **Hierarchical Refined Boost**. It achieves state-of-the-art accuracy on tabular data through two key innovations inside its C++ Core:
+HRBoost derives its name from **Hierarchical Refined Boost** — referring to its two-phase categorical split engine: BHC clustering followed by iterative refinement.
 
-### 1. LNM-BHC (Local Non-monotonic Bayesian Hierarchical Clustering, $k=3$)
+### 1. LNM-BHC + Iterative Partition Refinement
 Traditional GBDTs (such as LightGBM) handle categorical variables by sorting categories by their target statistics in 1D space, then performing a monotonic split. While fast, this sorting is highly vulnerable to noise, target leakage, and fails when categories do not exhibit monotonic relationships with the target.
 
-HRBoost addresses this by performing **Bayesian Hierarchical Clustering (BHC)** to merge categories into optimal partitions. To prevent ordering artifacts:
-- We introduce a **Local Non-monotonic BHC scan** with a sliding window of size $k=3$.
-- During hierarchical merging, categories are allowed to merge out-of-order within the window range.
-- This captures non-monotonic, non-adjacent category combinations, forming an optimal categorical split mask that traditional GBDTs miss.
+HRBoost addresses this with a two-phase approach:
+
+**Phase 1 — LNM-BHC (Local Non-monotonic Bayesian Hierarchical Clustering, $k=3$):**
+- Categories are initialized sorted by their gradient/hessian ratio ($G/H$).
+- **Bayesian Hierarchical Clustering** greedily merges the most similar adjacent category pair, using gradient statistics as the similarity criterion.
+- A **local window of $k=3$** allows merging non-adjacent categories within 3 steps — capturing non-monotonic combinations that monotonic splits miss.
+- Merging continues until 2 clusters remain, forming the initial Left/Right partition.
+
+**Phase 2 — Iterative Partition Refinement ("Refined" in HRBoost):**
+- Starting from the BHC partition, each category is individually tested for flipping (Left→Right or Right→Left).
+- The single move that most improves split gain is applied per iteration.
+- Up to 10 iterations, stopping when no improvement exceeds $10^{-7}$.
+- This corrects suboptimal greedy decisions made during BHC.
 
 ```
 [Traditional GBDT: 1D Monotonic Split]
 Category Sorted:  [A] -> [B] -> [C] -> [D]
 Split Boundary:          |  (Only monotonic cuts allowed)
 
-[HRBoost: Local Non-monotonic BHC (k=3)]
-Window Scans:     [A, B, C] -> Out-of-order merges allowed
-Output Mask:      Left child: {A, D} | Right child: {B, C}  (Complex combinations captured)
+[HRBoost: LNM-BHC (k=3) + Refinement]
+BHC clusters:     {A, D} | {B, C}  (non-adjacent merge via k=3 window)
+After Refinement: individual categories re-evaluated and moved if gain improves
 ```
 
 ### 2. Cohesion Dynamic Regularization
-In high-cardinality or highly imbalanced datasets, GBDTs often overfit by creating deep splits for rare categories. HRBoost implements **Cohesion Dynamic Regularization**:
-- During tree splitting, we measure the similarity ("Cohesion") of the proposed child node leaf values.
-- If the child predictions diverge excessively, the L2 regularization lambda ($\lambda$) is dynamically scaled upwards:
+In high-cardinality or highly imbalanced datasets, GBDTs often overfit by creating splits that barely separate the data. HRBoost implements **Cohesion Dynamic Regularization**:
+- During tree splitting, we measure the similarity ("Cohesion") of the proposed child node leaf value estimates.
+- When child predictions are **similar** (high cohesion — the split is uninformative), $\lambda$ is dynamically increased to penalize the split:
 
 $$\lambda_{dyn} = \lambda \times (1.0 + \gamma_{cohesion} \times Cohesion)$$
 
@@ -39,8 +48,9 @@ Where cohesion is computed as:
 
 $$Cohesion = 1.0 - \frac{|dL - dR|}{|dL| + |dR| + 10^{-5}}$$
 
-(where $dL$ and $dR$ represent the change in leaf weights).
-- This dynamically penalizes overly aggressive splits on sparse categories, encouraging the tree to search for broader, more generalizable split boundaries. Users can control this sensitivity via the `COHESION_REG` environment variable (default: `0.3`).
+(where $dL = G_L / H_L$ and $dR = G_R / H_R$ are the left/right leaf weight estimates).
+- When children **diverge** (low cohesion — informative split), $\lambda_{dyn} \approx \lambda$ and the split proceeds normally.
+- This discourages uninformative splits on rare or noisy categories. Users can control sensitivity via the `COHESION_REG` environment variable (default: `0.3`, set to `0.0` to disable).
 
 ---
 

@@ -45,9 +45,9 @@ pip install hrboost
 HRBoost exposes internal engine dynamics through system environment variables to avoid hyperparameter inflation:
 
 - **`COHESION_REG`** (*float*, default=`0.3`):
-  - Controls the intensity of the **Dynamic Cohesion Regularization** during tree splitting.
-  - A cohesion penalty factor is computed dynamically based on the difference in predicted leaf values between prospective children. If child leaf predictions diverge excessively, L2 regularization is dynamically increased.
-  - Set `export COHESION_REG=0.0` to disable this penalty. High-noise categorical settings benefit from higher values (e.g., `0.5` or `1.0`).
+  - Controls the intensity of **Dynamic Cohesion Regularization** during tree splitting.
+  - Cohesion measures how **similar** the two prospective child nodes are in terms of their leaf weight estimates ($dL = G_L/H_L$, $dR = G_R/H_R$). When children are similar (high cohesion — uninformative split), L2 regularization is dynamically increased to penalize the split. When children diverge (low cohesion — informative split), regularization stays at the base `reg_lambda`.
+  - Set `export COHESION_REG=0.0` to disable and revert to standard XGBoost-style gain. High-noise or high-cardinality categorical settings benefit from higher values (e.g., `0.5` or `1.0`).
 - **`MIN_CAT_COUNT`** (*float*, default=automatically scaled):
   - The minimum count required for a categorical bin to participate in BHC clustering. It helps filter out extremely rare categorical values.
 

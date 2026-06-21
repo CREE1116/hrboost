@@ -48,5 +48,7 @@ self_cdsb_mechanism.md
 dist/
 *.egg-info/
 .env
+*.sh
+
 
 
