@@ -45,3 +45,6 @@ our_model_differentiation.md
 prediction_correlation_analysis.md
 self_cdsb_mechanism.md
 이론.md
+dist/
+*.egg-info/
+
