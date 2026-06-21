@@ -67,6 +67,33 @@ Evaluation on multiclass datasets using 5-Fold Cross Validation.
 
 ---
 
+## Hyperparameter Optimization & Benchmarking
+
+HRBoost provides built-in tools for hyperparameter tuning and model evaluation against other frameworks (`LightGBM`, `XGBoost`, `CatBoost`).
+
+### 1. Hyperparameter Tuning (`optimizer.py`)
+You can use Optuna to automatically search for the best hyperparameters (including `COHESION_REG`) for any classification dataset:
+
+```bash
+# Run HPO tuning with 50 trials on 'credit-g' dataset
+python optimizer.py --dataset credit-g --n-trials 50 --output best_params_optuna.json
+```
+
+This will find the optimal parameters and record them into `best_params_optuna.json` under the dataset's name.
+
+### 2. Comprehensive Benchmarking (`benchmark.py`)
+HRBoost includes a benchmarking suite containing **14 diverse tabular datasets** (breast_cancer, digits, wine, car, nursery, splice, balance-scale, segment, and more). It dynamically applies HPO parameters from your JSON configuration.
+
+```bash
+# Evaluate HRBoost against competitors using optimized parameters
+python benchmark.py --params best_params_optuna.json
+
+# Or run a quick evaluation with fewer trees
+python benchmark.py --quick
+```
+
+---
+
 ## Installation & Quick Start
 
 ```bash

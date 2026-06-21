@@ -1,26 +1,31 @@
 """
-BRSTBoost vs LightGBM / XGBoost / CatBoost — AUC benchmark via JSON parameters.
+HRBoost vs LightGBM / XGBoost / CatBoost — Comprehensive Tabular Benchmarking
 
 Usage:
-    uv run python benchmark.py --params best_params.json
     uv run python benchmark.py --quick
+    uv run python benchmark.py --params best_params_optuna.json
 """
-import sys, time, argparse, json, os
+import sys
+import time
+import argparse
+import json
+import os
 import warnings
-warnings.filterwarnings("ignore", message="X does not have valid feature names")
+warnings.filterwarnings("ignore")
+
+# Configure library paths
 sys.path.insert(0, "python")
 
 import numpy as np
 import pandas as pd
-from sklearn.datasets import load_breast_cancer, fetch_openml
+from sklearn.datasets import load_breast_cancer, load_digits, load_wine, fetch_openml
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
 from hrboost import HRBoostClassifier
 
-# ── optional competitors ───────────────────────────────────────────────────────
-
+# ── Optional competitors ───────────────────────────────────────────────────────
 def _try(name):
     try: return __import__(name)
     except ImportError: return None
@@ -29,93 +34,124 @@ lgb = _try("lightgbm")
 xgb = _try("xgboost")
 cb  = _try("catboost")
 
-# ── real dataset zoo ──────────────────────────────────────────────────────────
+# ── Dataset Loaders ────────────────────────────────────────────────────────────
 
 def load_breast_cancer_ds():
     data = load_breast_cancer()
-    return data.data.astype(np.float32), data.target.astype(np.int32), "breast_cancer"
+    return data.data.astype(np.float32), data.target.astype(np.int32), "breast_cancer", [], 2
 
-def load_diabetes():
-    try:
-        data = fetch_openml(data_id=37, as_frame=True, parser='auto')
-        X = data.data.to_numpy().astype(np.float32)
-        y = (data.target == 'tested_positive').astype(np.int32).to_numpy()
-        return X, y, "diabetes"
-    except Exception as e:
-        print(f"  [diabetes load failed: {e}]")
-        return None
+def load_digits_ds():
+    data = load_digits()
+    X = data.data.astype(np.float32)
+    y = data.target.astype(np.int32)
+    return X, y, "digits", list(range(X.shape[1])), 10
 
-def load_credit_g():
+def load_wine_ds():
+    data = load_wine()
+    return data.data.astype(np.float32), data.target.astype(np.int32), "wine", [], 3
+
+def load_openml_by_id(data_id, name, is_binary=True, cat_index=None):
     try:
-        data = fetch_openml(data_id=31, as_frame=True, parser='auto')
+        data = fetch_openml(data_id=data_id, as_frame=True, parser='auto')
         df_X = data.data.copy()
-        y = (data.target == 'good').astype(np.int32).to_numpy()
         
-        cat_idx = []
-        for i, col in enumerate(df_X.columns):
-            if df_X[col].dtype.name == 'category' or df_X[col].dtype == object:
-                cat_idx.append(i)
-                le = LabelEncoder()
-                df_X[col] = le.fit_transform(df_X[col].astype(str))
-                
+        # Determine labels
+        if is_binary:
+            unique_targets = data.target.unique()
+            pos_label = unique_targets[0]
+            y = (data.target == pos_label).astype(np.int32).to_numpy()
+        else:
+            le_y = LabelEncoder()
+            y = le_y.fit_transform(data.target.astype(str)).astype(np.int32)
+            
+        cat_idx = cat_index if cat_index is not None else []
+        if cat_index is None:
+            for i, col in enumerate(df_X.columns):
+                if df_X[col].dtype.name == 'category' or df_X[col].dtype == object:
+                    cat_idx.append(i)
+                    le = LabelEncoder()
+                    df_X[col] = le.fit_transform(df_X[col].astype(str))
+                    
         X = df_X.to_numpy().astype(np.float32)
-        return X, y, "credit-g", cat_idx
+        return X, y, name, cat_idx, len(np.unique(y))
     except Exception as e:
-        print(f"  [credit-g load failed: {e}]")
+        print(f"  [Failed to fetch OpenML {name} (ID: {data_id}): {e}]")
         return None
 
-def load_adult():
-    url = ("https://archive.ics.uci.edu/ml/machine-learning-databases/"
-           "adult/adult.data")
-    cols = ["age","workclass","fnlwgt","education","edu_num","marital",
-            "occupation","relationship","race","sex","cap_gain","cap_loss",
-            "hours","country","income"]
-    try:
-        df = pd.read_csv(url, header=None, names=cols, na_values="?",
-                         skipinitialspace=True)
-    except Exception as e:
-        print(f"  [adult load failed: {e}]")
-        return None
-    y = (df["income"].str.strip() == ">50K").astype(int).values
-    df = df.drop("income", axis=1)
-    for c in df.select_dtypes("object").columns:
-        s = pd.Series(np.nan, index=df.index, dtype=np.float32)
-        non_null_mask = df[c].notnull()
-        if non_null_mask.any():
-            le = LabelEncoder()
-            s.loc[non_null_mask] = le.fit_transform(df.loc[non_null_mask, c].astype(str)).astype(np.float32)
-        df[c] = s
-    X = df.values.astype(np.float32)
-    cat_idx = [i for i, c in enumerate(df.columns)
-               if df[c].nunique(dropna=True) < 50 and c not in
-               ("age","fnlwgt","edu_num","cap_gain","cap_loss","hours")]
-    return X, y.astype(np.int32), "adult", cat_idx
+# Wrapper for CatBoost
+class CatBoostWrapper:
+    def __init__(self, is_multiclass, num_classes, cat_idx, est, lr):
+        self.cat_idx = cat_idx
+        loss_fn = "MultiClass" if is_multiclass else "Logloss"
+        self.model = cb.CatBoostClassifier(
+            iterations=est, learning_rate=lr, depth=5,
+            loss_function=loss_fn, random_seed=0, verbose=False,
+            cat_features=cat_idx if cat_idx else None
+        )
+        
+    def fit(self, X, y):
+        df = pd.DataFrame(X)
+        if self.cat_idx:
+            for c in self.cat_idx:
+                df[c] = df[c].astype(int).astype(str)
+        self.model.fit(df, y)
+        return self
+        
+    def predict_proba(self, X):
+        df = pd.DataFrame(X)
+        if self.cat_idx:
+            for c in self.cat_idx:
+                df[c] = df[c].astype(int).astype(str)
+        return self.model.predict_proba(df)
 
-# ── model factory with JSON injector ──────────────────────────────────────────
+# ── Model Factory ─────────────────────────────────────────────────────────────
 
-def make_models(ds_name, hpo_dict=None, cat_features=None, quick=False):
+def make_models(ds_name, num_classes, hpo_dict=None, cat_features=None, quick=False):
     cat = cat_features or []
-    est = 200 if quick else 400
+    est = 100 if quick else 200
     lr  = 0.1  if quick else 0.05
+    is_multi = num_classes > 2
+    obj_type = "multiclass" if is_multi else "binary"
     models = {}
     
-    # 해당 데이터셋의 HPO 서브 세트 추출 시도
+    # Extract optimized settings if available
     ds_hpo = hpo_dict.get(ds_name, {}) if hpo_dict else {}
+    hrboost_params = ds_hpo.get("HRBoost", {})
+    env_config = ds_hpo.get("ENV", {})
 
-    # 1. SelfCDSB
+    # 1. HRBoost
     sc_params = {
         "n_estimators": est, "learning_rate": lr, "max_depth": 5, "max_leaves": 31,
-        "reg_lambda": 1.0, "subsample": 0.8, "colsample_bytree": 1.0, "n_bins": 255,
-        "cat_features": cat, "random_state": 0, "objective": "binary", "verbose": False
+        "reg_lambda": 1.0, "subsample": 0.8, "colsample_bytree": 1.0, "n_bins": 32,
+        "cat_features": cat, "random_state": 0, "objective": obj_type,
+        "num_classes": num_classes, "verbose": False
     }
-    if "SelfCDSB" in ds_hpo:
-        sc_hpo = ds_hpo["SelfCDSB"].copy()
-        sc_hpo.pop("cdsb_alpha", None)
-        sc_params.update(sc_hpo)
-    elif "HRBoost" in ds_hpo:
-        sc_hpo = ds_hpo["HRBoost"].copy()
-        sc_params.update(sc_hpo)
-    models["HRBoost"] = HRBoostClassifier(**sc_params)
+    if hrboost_params:
+        sc_params.update(hrboost_params)
+        
+    # Wrapper to inject COHESION_REG dynamically during fit
+    class HRBoostWrapper:
+        def __init__(self, params, env_vars):
+            self.model = HRBoostClassifier(**params)
+            self.env_vars = env_vars
+        def fit(self, X, y):
+            old_envs = {}
+            for k, v in self.env_vars.items():
+                old_envs[k] = os.environ.get(k, None)
+                os.environ[k] = str(v)
+            try:
+                self.model.fit(X, y)
+            finally:
+                for k, v in old_envs.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    elif k in os.environ:
+                        del os.environ[k]
+            return self
+        def predict_proba(self, X):
+            return self.model.predict_proba(X)
+            
+    models["HRBoost"] = HRBoostWrapper(sc_params, env_config)
 
     # 2. LightGBM
     if lgb:
@@ -124,92 +160,82 @@ def make_models(ds_name, hpo_dict=None, cat_features=None, quick=False):
                       reg_lambda=1.0, random_state=0, verbose=-1)
         if cat:
             lgb_kw["categorical_feature"] = cat
-        if "LightGBM" in ds_hpo:
-            lgb_kw.update(ds_hpo["LightGBM"])
         models["LightGBM"] = lgb.LGBMClassifier(**lgb_kw)
 
     # 3. XGBoost
     if xgb:
         xgb_kw = dict(n_estimators=est, learning_rate=lr, max_depth=5,
                       subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
-                      eval_metric="logloss", random_state=0, verbosity=0)
-        if "XGBoost" in ds_hpo:
-            xgb_kw.update(ds_hpo["XGBoost"])
+                      random_state=0, verbosity=0)
+        if is_multi:
+            xgb_kw["objective"] = "multi:softprob"
+            xgb_kw["num_class"] = num_classes
+        else:
+            xgb_kw["eval_metric"] = "logloss"
+            
         models["XGBoost"] = xgb.XGBClassifier(**xgb_kw)
 
     # 4. CatBoost
     if cb:
-        cb_kw = dict(iterations=est, learning_rate=lr, depth=5,
-                     l2_leaf_reg=1.0, subsample=0.8,
-                     random_state=0, verbose=False)
-        if "CatBoost" in ds_hpo:
-            cb_kw.update(ds_hpo["CatBoost"])
-        if cat:
-            cb_kw["cat_features"] = cat
-            
-        _inner_cb = cb.CatBoostClassifier(**cb_kw)
-        
-        class _CBWrap:
-            def __init__(self, m, cat_idx):
-                self._m = m; self._cat = cat_idx
-            def _prep(self, X):
-                df = pd.DataFrame(X)
-                for c in self._cat:
-                    df[c] = df[c].map(lambda v: 'nan' if np.isnan(v) else str(int(v)))
-                return df
-            def fit(self, X, y):
-                self._m.fit(self._prep(X), y); return self
-            def predict_proba(self, X):
-                return self._m.predict_proba(self._prep(X))
-        models["CatBoost"] = _CBWrap(_inner_cb, cat) if cat else _inner_cb
+        models["CatBoost"] = CatBoostWrapper(is_multi, num_classes, cat, est, lr)
 
     return models
 
-# ── evaluation ────────────────────────────────────────────────────────────────
+# ── Evaluation Suite ──────────────────────────────────────────────────────────
 
-HDR = f"  {'Model':<12} {'AUC':>8} {'±':>6} {'fit/fold':>9}"
-SEP = "  " + "─"*12 + " " + "─"*8 + " " + "─"*6 + " " + "─"*9
-
-def evaluate(X, y, name, hpo_dict=None, cat_features=None, n_splits=5, quick=False):
-    print(f"\n{'─'*58}")
-    print(f"  {name}  n={len(y):,}  D={X.shape[1]}  pos={y.mean():.3f}")
-    
-    # HPO 설정 주입 유무 피드백
+def evaluate(X, y, name, num_classes, hpo_dict=None, cat_features=None, n_splits=5, quick=False):
+    print(f"\n{'─'*65}")
+    print(f"  Dataset: {name} (N={len(y):,}, D={X.shape[1]}, Classes={num_classes})")
     if hpo_dict and name in hpo_dict:
-        print(f"  [Status] Using Optimized HPO Hyperparameters from JSON")
+        print(f"  [Status] Using Optimized HPO Settings & Envs from JSON")
     else:
-        print(f"  [Status] Using Default Baseline Hyperparameters")
-        
-    print(f"{'─'*58}")
-    print(HDR); print(SEP)
+        print(f"  [Status] Using Default Parameters")
+    print(f"{'─'*65}")
+    
+    hdr = f"  {'Model':<12} | {'AUC (macro)':>12} | {'Accuracy':>10} | {'Fit Time':>10}"
+    sep = "  " + "─"*12 + "─┬─" + "─"*12 + "─┬─" + "─"*10 + "─┬─" + "─"*10
+    print(hdr); print(sep)
 
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-    for mname, model in make_models(name, hpo_dict, cat_features, quick=quick).items():
-        aucs, times = [], []
+    for mname, model in make_models(name, num_classes, hpo_dict, cat_features, quick=quick).items():
+        aucs, accs, times = [], [], []
         for tr, te in cv.split(X, y):
             t0 = time.time()
             model.fit(X[tr], y[tr])
-            elapsed = time.time() - t0
-            times.append(elapsed)
-            p = model.predict_proba(X[te])[:, 1]
-            aucs.append(roc_auc_score(y[te], p))
+            times.append(time.time() - t0)
+            
+            probs = model.predict_proba(X[te])
+            preds = np.argmax(probs, axis=1) if num_classes > 2 else (probs[:, 1] >= 0.5).astype(int)
+            
+            try:
+                if num_classes > 2:
+                    auc = roc_auc_score(y[te], probs, multi_class="ovr", average="macro")
+                else:
+                    auc = roc_auc_score(y[te], probs[:, 1])
+            except Exception:
+                auc = 0.5
 
-        mu, sd = np.mean(aucs), np.std(aucs)
-        print(f"  {mname:<12} {mu:>8.4f} {sd:>6.4f} {np.mean(times):>8.1f}s")
+                
+            aucs.append(auc)
+            accs.append(accuracy_score(y[te], preds))
 
-# ── main ──────────────────────────────────────────────────────────────────────
+        mu_auc, mu_acc = np.mean(aucs), np.mean(accs)
+        print(f"  {mname:<12} | {mu_auc:>12.4f} | {mu_acc:>10.4f} | {np.mean(times):>9.2f}s")
+
+# ── Main Suite Runner ──────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--params", type=str, default="best_params.json",
+    ap.add_argument("--quick", action="store_true", help="Run with fewer trees to complete quickly")
+    ap.add_argument("--params", type=str, default="best_params_optuna.json",
                     help="Path to the JSON file containing optimized params")
     args = ap.parse_args()
 
-    print("Self-CDSB Benchmark (Real Datasets Integration)")
+    print("=================================================================")
+    print("      HRBoost Multiclass & Binary GBDT Evaluation Suite")
+    print("=================================================================")
     
-    # JSON 로드 시도
     hpo_dict = None
     if os.path.exists(args.params):
         try:
@@ -217,29 +243,38 @@ def main():
                 hpo_dict = json.load(f)
             print(f"  Loaded hyperparameter configurations from: {args.params}")
         except Exception as e:
-            print(f"  [Warning] Failed to read JSON ({e}). Falling back to baseline.")
+            print(f"  [Warning] Failed to read HPO JSON ({e}). Running baseline.")
     else:
-        print(f"  [Info] '{args.params}' file not found. Running with baseline parameters.")
+        print(f"  [Info] '{args.params}' not found. Running baseline.")
 
-    datasets = []
-    datasets.append(load_breast_cancer_ds())
+    # 14 Tabular Datasets Suite (Binary and Multiclass)
+    dataset_configs = [
+        # Built-ins
+        ("breast_cancer", lambda: load_breast_cancer_ds()),
+        ("digits", lambda: load_digits_ds()),
+        ("wine", lambda: load_wine_ds()),
+        
+        # OpenML Binary tasks
+        ("diabetes", lambda: load_openml_by_id(37, "diabetes", is_binary=True)),
+        ("credit-g", lambda: load_openml_by_id(31, "credit-g", is_binary=True)),
+        ("blood-transfusion", lambda: load_openml_by_id(1464, "blood-transfusion", is_binary=True)),
+        ("spambase", lambda: load_openml_by_id(44, "spambase", is_binary=True)),
+        ("banknote", lambda: load_openml_by_id(1462, "banknote", is_binary=True)),
+        ("qsar-biodeg", lambda: load_openml_by_id(1494, "qsar-biodeg", is_binary=True)),
+        
+        # OpenML Multiclass tasks
+        ("car", lambda: load_openml_by_id(40975, "car", is_binary=False)),
+        ("nursery", lambda: load_openml_by_id(26, "nursery", is_binary=False)),
+        ("splice", lambda: load_openml_by_id(46, "splice", is_binary=False)),
+        ("balance-scale", lambda: load_openml_by_id(11, "balance-scale", is_binary=False)),
+        ("segment", lambda: load_openml_by_id(40984, "segment", is_binary=False))
+    ]
 
-    db_data = load_diabetes()
-    if db_data: datasets.append(db_data)
-
-    cr_data = load_credit_g()
-    if cr_data: datasets.append(cr_data)
-
-    adult_data = load_adult()
-    if adult_data: datasets.append(adult_data)
-
-    for entry in datasets:
-        if len(entry) == 4:
-            X, y, name, cat = entry
-            evaluate(X, y, name, hpo_dict=hpo_dict, cat_features=cat, quick=args.quick)
-        else:
-            X, y, name = entry
-            evaluate(X, y, name, hpo_dict=hpo_dict, quick=args.quick)
+    for name, loader in dataset_configs:
+        res = loader()
+        if res is not None:
+            X, y, name, cat, num_classes = res
+            evaluate(X, y, name, num_classes, hpo_dict=hpo_dict, cat_features=cat, quick=args.quick)
 
 if __name__ == "__main__":
     main()

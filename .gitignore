@@ -47,4 +47,6 @@ self_cdsb_mechanism.md
 이론.md
 dist/
 *.egg-info/
+.env
+
 

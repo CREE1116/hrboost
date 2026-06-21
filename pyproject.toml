@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hrboost"
-version = "0.1.1"
+version = "0.1.2"
 description = "HRBoost: Hierarchical Refined Boost - GBDT with Non-monotonic Bayesian Hierarchical Clustering"
 readme = "README_pypi.md"
 requires-python = ">=3.10"

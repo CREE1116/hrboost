@@ -1,0 +1,19 @@
+{
+    "credit-g": {
+        "HRBoost": {
+            "n_estimators": 165,
+            "learning_rate": 0.06881859667121444,
+            "max_depth": 4,
+            "max_leaves": 119,
+            "reg_lambda": 4.9119105165462384,
+            "subsample": 0.8030308602599977,
+            "colsample_bytree": 0.6905548275542069,
+            "n_bins": 77,
+            "min_child_weight": 0.05770908491898839,
+            "gamma": 0.1317286282726733
+        },
+        "ENV": {
+            "COHESION_REG": 0.6998850940247704
+        }
+    }
+}
